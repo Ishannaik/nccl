@@ -6,21 +6,28 @@
 
 // main.cu
 //
-// Host-side driver for the MC AllReduce sample kernels.
+// Host-side driver for the custom AllReduce sample kernels.
 //
 // What it demonstrates:
-//   1. Initializing NCCL and creating an ncclDevComm with lsaMultimem=true.
+//   1. Initializing NCCL and creating an ncclDevComm (lsaMultimem=true when
+//      NVLink multicast is available).
 //   2. Registering symmetric buffers as ncclWindows with NCCL_WIN_COLL_SYMMETRIC.
 //   3. Passing ncclDevComm and ncclWindow by value to custom CUDA kernels.
 //   4. oneshot_mc_allreduce_kernel   — AllReduce via multimem.ld_reduce.
 //   5. twoshot_mc_simple_allreduce_kernel — RS+AG via multimem.ld_reduce + multimem.st.
 //   6. twoshot_mc_poison_allreduce_kernel — twoshot with Lamport sentinel completion.
-//   7. ncclAllReduce baseline.
-//   8. Side-by-side performance comparison across CTA counts and message sizes.
+//   7. oneshot_lsa_push_allreduce_kernel:    one-shot push over LSA unicast
+//      pointers with an LSA barrier (PCIe P2P, no multicast needed).
+//   8. oneshot_lsa_push_ll_allreduce_kernel: same push with LL flags
+//      (ncclLLA2ASession) instead of a barrier.
+//   9. ncclAllReduce baseline.
+//  10. Side-by-side performance comparison across CTA counts and message sizes.
 //
-// All three custom kernels require sm >= 9.0 (Hopper / Blackwell) for the
+// The three MC kernels require sm >= 9.0 (Hopper / Blackwell) for the
 // multimem PTX instructions.  The driver checks device capability at startup
-// and skips MC kernels on unsupported hardware.
+// and skips MC kernels on unsupported hardware.  The two LSA push kernels run
+// on any GPUs whose communicator reports Device API support with a single LSA
+// team, including PCIe-only systems with CUDA P2P.
 //
 // Only public NCCL headers are used:
 //   nccl.h          — ncclComm, ncclWindow, ncclMemAlloc, ncclCommWindowRegister
@@ -38,8 +45,11 @@
 //   -h, --help         print this help and exit
 //
 // Prerequisites:
-//   - At least 2 MPI ranks on NVLink-connected GPUs with multicast support.
-//   - CUDA >= 12.2, GPU compute capability >= 9.0.
+//   - At least 2 MPI ranks.
+//   - MC kernels: NVLink-connected GPUs with multicast support,
+//     CUDA >= 12.2, GPU compute capability >= 9.0.
+//   - LSA push kernels: Device API support with a single LSA team
+//     (on PCIe: working CUDA P2P between all GPUs).
 
 #include <stdio.h>
 #include <stdint.h>
@@ -57,6 +67,8 @@
 #include "oneshot_mc_allreduce_kernel.cuh"
 #include "twoshot_mc_simple_allreduce_kernel.cuh"
 #include "twoshot_mc_poison_allreduce_kernel.cuh"
+#include "oneshot_lsa_push_allreduce_kernel.cuh"
+#include "oneshot_lsa_push_ll_allreduce_kernel.cuh"
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -70,6 +82,14 @@
 #define L2_FLUSH_BYTES   (128 << 20)
 
 #define WARMUP_ITERS     5
+
+// One-shot push kernels copy the whole message to every peer, so they are
+// only measured up to this size.  It also sizes their scratch buffers.
+#define PUSH_MAX_BYTES   (1L << 20)
+
+// Threads per CTA of the push kernels (tuned on 2 x T4, see README).
+#define LSA_PUSH_THREADS     512
+#define LSA_PUSH_LL_THREADS  512
 
 // Correctness test: number of twoshot_mc_poison iterations.
 static const int TEST_ITERS = 50;
@@ -288,10 +308,22 @@ int main(int argc, char* argv[]) {
     config.blocking = 1;
     NCCLCHECK(ncclCommInitRankConfig(&comm, nRanks, id, myRank, &config));
 
+    // The LSA push kernels need Device API support with one LSA team (all
+    // ranks reachable by load/store).  On PCIe this means working CUDA P2P.
+    ncclCommProperties_t props = NCCL_COMM_PROPERTIES_INITIALIZER;
+    NCCLCHECK(ncclCommQueryProperties(comm, &props));
+    bool hasLsa = props.deviceApiSupport && props.nLsaTeams == 1;
+    hasMC = hasMC && hasLsa && props.multimemSupport;
+    if (!hasLsa && myRank == 0)
+        fprintf(stderr, "Warning: no Device API support with a single LSA team"
+                        "; all custom kernels will be skipped.\n");
+    else if (!hasMC && myRank == 0)
+        fprintf(stderr, "Warning: no NVLink multicast; MC kernels will be skipped.\n");
+
     // ------------------------------------------------------------------
     // 4. Allocate symmetric buffers
     //
-    //   sendBuff  — input for all three kernels.  Registered with
+    //   sendBuff  — input for all custom kernels.  Registered with
     //               NCCL_WIN_COLL_SYMMETRIC so ncclGetLsaMultimemPointer
     //               returns its multicast VA (used by multimem.ld_reduce).
     //   recvBuff  — primary output / twoshot_mc_poison rotation buffer 0.
@@ -327,22 +359,45 @@ int main(int argc, char* argv[]) {
     NCCLCHECK(ncclCommWindowRegister(comm, recvBuff3, bufBytes,
                                      &recvWin3, NCCL_WIN_COLL_SYMMETRIC));
 
+    // Scratch for oneshot_lsa_push: 2 slots x nRanks source ranks.
+    const long   pushMaxBytes  = maxMsgBytes < PUSH_MAX_BYTES ? maxMsgBytes : PUSH_MAX_BYTES;
+    const size_t pushSlotLines = (size_t)pushMaxBytes / sizeof(float4);
+    const size_t pushBytes     = 2 * (size_t)nRanks * pushSlotLines * sizeof(float4);
+    void* pushScratch = nullptr;
+    ncclWindow_t pushWin;
+    if (hasLsa) {
+        NCCLCHECK(ncclMemAlloc(&pushScratch, pushBytes));
+        NCCLCHECK(ncclCommWindowRegister(comm, pushScratch, pushBytes,
+                                         &pushWin, NCCL_WIN_COLL_SYMMETRIC));
+    }
+
     char* flushBuf;
     CUDACHECK(cudaMalloc((void**)&flushBuf, L2_FLUSH_BYTES));
 
     // ------------------------------------------------------------------
     // 5. Create LSA device communicator
     //
-    //   lsaMultimem=true  — activates the multicast VA for sendWin/recvWins,
+    //   lsaMultimem       : set when multicast is available; activates the
+    //                       multicast VA for sendWin/recvWins,
     //                       required by multimem.ld_reduce and multimem.st.
     //   lsaBarrierCount   — pre-allocates barrier slots 0..maxCtaCount-1,
     //                       one per CTA (each CTA uses slot blockIdx.x).
+    //   LL buffer         : ncclLLA2A resource for oneshot_lsa_push_ll: one
+    //                       region per CTA, sized for the largest chunk
+    //                       (smallest CTA count, largest push message).
     // ------------------------------------------------------------------
-    ncclDevComm_t devComm;
-    {
+    ncclDevComm_t     devComm;
+    ncclLLA2AHandle_t pushLL;
+    if (hasLsa) {
         ncclDevCommRequirements_t reqs = NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
         reqs.lsaBarrierCount = maxCtaCount;
-        reqs.lsaMultimem     = true;
+        reqs.lsaMultimem     = hasMC;
+        ncclDevResourceRequirements_t llReq;
+        int llSlots = ncclLLA2ACalcSlots(
+            (nRanks - 1) * (int)lsaPushLLChunkLines(pushSlotLines, minCtaCount), sizeof(float4));
+        NCCLCHECK(ncclLLA2ACreateRequirement(maxCtaCount, llSlots, &pushLL, &llReq));
+        llReq.next = reqs.resourceRequirementsList;
+        reqs.resourceRequirementsList = &llReq;
         NCCLCHECK(ncclDevCommCreate(comm, &reqs, &devComm));
     }
 
@@ -450,6 +505,37 @@ int main(int argc, char* argv[]) {
             }
         }
         return true;
+    };
+
+    // checkAllValue: like checkAllEqual, for an arbitrary expected value.
+    auto checkAllValue = [&](const std::vector<float4>& h, int n, float want,
+                             const char* tag) -> bool {
+        for (int i = 0; i < n; i++) {
+            float4 s = h[i];
+            if (s.x != want || s.y != want || s.z != want || s.w != want) {
+                fprintf(stderr,
+                    "[Rank %d] %s FAIL: recvBuf[%d]={%g,%g,%g,%g},"
+                    " expected all %g\n",
+                    myRank, tag, i, s.x, s.y, s.z, s.w, want);
+                return false;
+            }
+        }
+        return true;
+    };
+
+    // The push kernel alternates its scratch slot on every call.
+    unsigned pushSlot = 0;
+    auto launchPush = [&](int ll, int nBlocks, const float4* in, float4* out,
+                          size_t nlines) {
+        if (ll)
+            oneshot_lsa_push_ll_allreduce_kernel
+                <<<nBlocks, LSA_PUSH_LL_THREADS, 0, stream>>>(
+                    in, out, pushLL, nlines, devComm);
+        else
+            oneshot_lsa_push_allreduce_kernel
+                <<<nBlocks, LSA_PUSH_THREADS, 0, stream>>>(
+                    in, out, pushWin, pushSlotLines, nlines,
+                    (int)(pushSlot++ & 1), devComm);
     };
 
     int pass = 1;
@@ -565,6 +651,47 @@ int main(int argc, char* argv[]) {
                 if (pass && myRank == 0) printf("[Correctness %s] PASS\n", tag);
                 fflush(stdout);
             }
+
+            // ---- 6d/6e. oneshot_lsa_push and oneshot_lsa_push_ll ----
+            //
+            // A chain of PUSH_TEST_ITERS calls with no host sync in between,
+            // each call reducing the previous call's output (the first one
+            // reads sendBuff, the last one runs in place).  After call k every
+            // rank holds the same value v_k, so v_{k+1} = nRanks * v_k, summed
+            // in rank order exactly as the kernels do.  A call that reads a
+            // stale scratch slot or LL line breaks the chain.
+            for (int ll = 0; ll < 2 && hasLsa && pass; ll++) {
+                if ((size_t)tNlines > pushSlotLines) continue;
+                const int PUSH_TEST_ITERS = 6;
+                snprintf(tag, sizeof(tag), "%s[nlines=%d,ctas=%d]",
+                         ll ? "oneshot_lsa_push_ll" : "oneshot_lsa_push",
+                         tNlines, tCtaCount);
+                float4* bufs[2] = { recvBuff, recvBuff2 };
+                MPICHECK(MPI_Barrier(MPI_COMM_WORLD));
+                for (int k = 0; k < PUSH_TEST_ITERS; k++) {
+                    const float4* in  = (k == 0) ? sendBuff : bufs[(k - 1) % 2];
+                    float4*       out = (k == PUSH_TEST_ITERS - 1) ? bufs[(k - 1) % 2]
+                                                                   : bufs[k % 2];
+                    launchPush(ll, tCtaCount, in, out, (size_t)tNlines);
+                }
+                CUDACHECK(cudaStreamSynchronize(stream));
+
+                float want = EXPECTED;
+                for (int k = 1; k < PUSH_TEST_ITERS; k++) {
+                    float v = want;
+                    for (int r = 1; r < nRanks; r++) v += want;
+                    want = v;
+                }
+                std::vector<float4> h(tNlines);
+                CUDACHECK(cudaMemcpy(h.data(), bufs[(PUSH_TEST_ITERS - 2) % 2],
+                                     (size_t)tNlines * sizeof(float4),
+                                     cudaMemcpyDeviceToHost));
+                if (!checkAllValue(h, tNlines, want, tag)) pass = 0;
+                MPICHECK(MPI_Allreduce(MPI_IN_PLACE, &pass, 1, MPI_INT,
+                                       MPI_MIN, MPI_COMM_WORLD));
+                if (pass && myRank == 0) printf("[Correctness %s] PASS\n", tag);
+                fflush(stdout);
+            }
         }
     }
 
@@ -607,16 +734,18 @@ int main(int argc, char* argv[]) {
     for (int nBlocks = minCtaCount; nBlocks <= maxCtaCount; nBlocks *= 2) {
         if (myRank == 0) {
             printf("=== CTAs: %d ===\n", nBlocks);
-            printf("%-12s  %-13s %-10s  %-13s %-10s  %-13s %-10s  %-13s %-10s\n",
+            printf("%-12s  %-13s %-10s  %-13s %-10s  %-13s %-10s  %-13s %-10s  %-13s %-10s  %-13s %-10s\n",
                    "msg(bytes)",
                    "oneshot_mc",   "(GB/s)",
                    "2shot_mc",     "(GB/s)",
                    "2shot_mc_pois","(GB/s)",
+                   "push_lsa",     "(GB/s)",
+                   "push_lsa_ll",  "(GB/s)",
                    "nccl_ar",      "(GB/s)");
-            printf("%-12s  %-13s %-10s  %-13s %-10s  %-13s %-10s  %-13s %-10s\n",
-                   "", "(us)", "", "(us)", "", "(us)", "", "(us)", "");
+            printf("%-12s  %-13s %-10s  %-13s %-10s  %-13s %-10s  %-13s %-10s  %-13s %-10s  %-13s %-10s\n",
+                   "", "(us)", "", "(us)", "", "(us)", "", "(us)", "", "(us)", "", "(us)", "");
             printf("------------------------------------------------------------------------------------"
-                   "-----------------------------------\n");
+                   "------------------------------------------------------------------------------\n");
             fflush(stdout);
         }
 
@@ -710,6 +839,25 @@ int main(int argc, char* argv[]) {
                                        MPI_MAX, MPI_COMM_WORLD));
             }
 
+            // ---- oneshot_lsa_push / oneshot_lsa_push_ll ----
+            float pushLat[2] = { 0.f, 0.f };
+            bool  hasPush = hasLsa && msgBytes <= pushMaxBytes;
+            for (int ll = 0; ll < 2 && hasPush; ll++) {
+                CUDACHECK(cudaMemset(flushBuf, 0, L2_FLUSH_BYTES));
+                MPICHECK(MPI_Barrier(MPI_COMM_WORLD));
+                for (int i = 0; i < WARMUP_ITERS; i++)
+                    launchPush(ll, nBlocks, sendBuff, recvBuff, (size_t)nlines);
+                CUDACHECK(cudaStreamSynchronize(stream));
+
+                MPICHECK(MPI_Barrier(MPI_COMM_WORLD));
+                pushLat[ll] = runTimed(useGraph, nTimed, stream, evStart, evStop, [&]() {
+                    for (int i = 0; i < nTimed; i++)
+                        launchPush(ll, nBlocks, sendBuff, recvBuff, (size_t)nlines);
+                });
+                MPICHECK(MPI_Allreduce(MPI_IN_PLACE, &pushLat[ll], 1, MPI_FLOAT,
+                                       MPI_MAX, MPI_COMM_WORLD));
+            }
+
             // ---- ncclAllReduce baseline ----
             float ncclLat = 0.f;
             {
@@ -744,6 +892,7 @@ int main(int argc, char* argv[]) {
                 char oneLat_s[32]  = "N/A", oneBw_s[32]  = "N/A";
                 char twoLat_s[32]  = "N/A", twoBw_s[32]  = "N/A";
                 char poisLat_s[32] = "N/A", poisBw_s[32] = "N/A";
+                char pushLat_s[2][32] = { "N/A", "N/A" }, pushBw_s[2][32] = { "N/A", "N/A" };
                 char ncclLat_s[32], ncclBw_s[32];
 
                 if (hasMC)
@@ -755,14 +904,20 @@ int main(int argc, char* argv[]) {
                     fmtCols(poisLat_s, poisBw_s, poisLat,
                             twoNlines * (long)sizeof(float4));
                 }
+                if (hasPush)
+                    for (int ll = 0; ll < 2; ll++)
+                        fmtCols(pushLat_s[ll], pushBw_s[ll], pushLat[ll],
+                                nlines * (long)sizeof(float4));
                 fmtCols(ncclLat_s, ncclBw_s, ncclLat,
                         nlines * (long)sizeof(float4));
 
-                printf("%-12ld  %-13s %-10s  %-13s %-10s  %-13s %-10s  %-13s %-10s\n",
+                printf("%-12ld  %-13s %-10s  %-13s %-10s  %-13s %-10s  %-13s %-10s  %-13s %-10s  %-13s %-10s\n",
                        msgBytes,
                        oneLat_s, oneBw_s,
                        twoLat_s, twoBw_s,
                        poisLat_s, poisBw_s,
+                       pushLat_s[0], pushBw_s[0],
+                       pushLat_s[1], pushBw_s[1],
                        ncclLat_s, ncclBw_s);
                 fflush(stdout);
             }
@@ -777,7 +932,11 @@ int main(int argc, char* argv[]) {
     CUDACHECK(cudaEventDestroy(evStart));
     CUDACHECK(cudaEventDestroy(evStop));
     CUDACHECK(cudaStreamDestroy(stream));
-    NCCLCHECK(ncclDevCommDestroy(comm, &devComm));
+    if (hasLsa) {
+        NCCLCHECK(ncclDevCommDestroy(comm, &devComm));
+        NCCLCHECK(ncclCommWindowDeregister(comm, pushWin));
+        NCCLCHECK(ncclMemFree(pushScratch));
+    }
     NCCLCHECK(ncclCommWindowDeregister(comm, sendWin));
     NCCLCHECK(ncclCommWindowDeregister(comm, recvWin));
     NCCLCHECK(ncclCommWindowDeregister(comm, recvWin2));
