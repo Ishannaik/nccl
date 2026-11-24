@@ -48,7 +48,8 @@ $(DST_DIR)/allreduce: main.cu \
     twoshot_mc_simple_allreduce_kernel.cuh \
     twoshot_mc_poison_allreduce_kernel.cuh \
     oneshot_lsa_push_allreduce_kernel.cuh \
-    oneshot_lsa_push_ll_allreduce_kernel.cuh
+    oneshot_lsa_push_ll_allreduce_kernel.cuh \
+    lsa_push_reduce.cuh
 	@mkdir -p $(DST_DIR)
 	@printf "Compiling+linking allreduce\n"
 	$(NVCC) $(NVCUFLAGS) $(MPI_CFLAGS) $< -o $@ $(LDFLAGS)

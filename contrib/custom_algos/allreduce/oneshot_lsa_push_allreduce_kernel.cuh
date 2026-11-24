@@ -31,6 +31,10 @@
 // every peer to have started call k+1, which runs after the peer's call k
 // (stream order) finished reading the slot.
 //
+// T is the element type (float, __half or __nv_bfloat16).  Data moves as
+// 16-byte lines (float4) for every type; only the local add depends on T
+// (lsa_push_reduce.cuh).  nlines counts 16-byte lines.
+//
 // Summation order is the same on every rank, so all ranks get bit-identical
 // results.  sendLocal may alias recvLocal (in place).
 //
@@ -45,6 +49,7 @@
 
 #include <cuda_runtime.h>
 #include "nccl_device.h"
+#include "lsa_push_reduce.cuh"
 
 #define LSA_PUSH_MAXTHREADS 1024
 
@@ -55,10 +60,7 @@ __device__ __forceinline__ size_t lsaPushChunkLines(size_t nlines, int nBlocks) 
     return (c + 31) & ~(size_t)31;
 }
 
-__device__ __forceinline__ float4 lsaPushAdd(float4 a, float4 b) {
-    return make_float4(a.x + b.x, a.y + b.y, a.z + b.z, a.w + b.w);
-}
-
+template <typename T = float>
 __global__ void __launch_bounds__(LSA_PUSH_MAXTHREADS)
     oneshot_lsa_push_allreduce_kernel(const float4* sendLocal,
                                       float4*       recvLocal,
@@ -98,7 +100,7 @@ __global__ void __launch_bounds__(LSA_PUSH_MAXTHREADS)
             const float4* src = (r == team.rank)
                 ? sendLocal
                 : (const float4*)ncclGetLocalPointer(scratchWin, (slotBase + r) * slotLines * sizeof(float4));
-            acc = (r == 0) ? src[i] : lsaPushAdd(acc, src[i]);
+            acc = (r == 0) ? src[i] : LsaPushSum<T>::add(acc, src[i]);
         }
         recvLocal[i] = acc;
     }

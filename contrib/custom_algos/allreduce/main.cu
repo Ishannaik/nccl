@@ -42,6 +42,9 @@
 //   -m, --min-msg  B   smallest message size in bytes (default 16)
 //   -M, --max-msg  B   largest  message size in bytes (default 128 MB)
 //       --no-graph     disable CUDA graph capture (default: enabled)
+//   -d, --dtype    T   float | half | bf16: element type of the push kernels
+//                      and the NCCL baseline in the sweep (default float;
+//                      MC kernels are float only and are skipped otherwise)
 //   -h, --help         print this help and exit
 //
 // Prerequisites:
@@ -148,6 +151,7 @@ static void printUsage(const char* prog) {
         "  -m, --min-msg  B   smallest message size in bytes (default 16)\n"
         "  -M, --max-msg  B   largest  message size in bytes (default %ld)\n"
         "      --no-graph     disable CUDA graph capture (default: enabled)\n"
+        "  -d, --dtype    T   float | half | bf16 for push kernels + NCCL (default float)\n"
         "  -h, --help         print this help and exit\n",
         prog, (long)PERF_MAX_NLINES * (long)sizeof(float4));
 }
@@ -195,6 +199,64 @@ __global__ void fill_float(float* buf, float val, int n) {
     if (i < n) buf[i] = val;
 }
 
+// Element types of the push kernels.  Data moves as 16-byte lines for every
+// type; only the add differs (lsa_push_reduce.cuh).
+enum { DT_FLOAT = 0, DT_HALF = 1, DT_BF16 = 2, DT_COUNT = 3 };
+static const char*    dtypeName(int d) { return d == DT_HALF ? "half" : d == DT_BF16 ? "bf16" : "float"; }
+static size_t         dtypeSize(int d) { return d == DT_FLOAT ? 4 : 2; }
+static ncclDataType_t dtypeNccl(int d) { return d == DT_HALF ? ncclHalf : d == DT_BF16 ? ncclBfloat16 : ncclFloat; }
+
+template <typename T> __device__ __forceinline__ T     cvtFromFloat(float v);
+template <> __device__ __forceinline__ float           cvtFromFloat<float>(float v)         { return v; }
+template <> __device__ __forceinline__ __half          cvtFromFloat<__half>(float v)        { return __float2half(v); }
+template <> __device__ __forceinline__ __nv_bfloat16   cvtFromFloat<__nv_bfloat16>(float v) { return __float2bfloat16(v); }
+__device__ __forceinline__ float cvtToFloat(float v)         { return v; }
+__device__ __forceinline__ float cvtToFloat(__half v)        { return __half2float(v); }
+__device__ __forceinline__ float cvtToFloat(__nv_bfloat16 v) { return __bfloat162float(v); }
+
+// fill_pattern — buf[i] = base * 2^(i % 8) (shift 0 gives a uniform fill).
+// Powers of two keep every partial sum exact in half and bf16 for small rank
+// counts, so the 16-bit correctness test can compare bit-exactly, and the
+// pattern differs across the 8 lanes of a 16-byte line.
+template <typename T>
+__global__ void fill_pattern(T* buf, float base, int shift, size_t n) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) buf[i] = cvtFromFloat<T>(base * (float)(1 << ((i & 7) * shift)));
+}
+
+// to_float — widen a typed buffer to float for host-side checks.
+template <typename T>
+__global__ void to_float(const T* in, float* out, size_t n) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = cvtToFloat(in[i]);
+}
+
+template <typename T>
+static void fillTyped(void* buf, float base, int shift, size_t n, cudaStream_t s) {
+    fill_pattern<T><<<(unsigned)((n + 255) / 256), 256, 0, s>>>((T*)buf, base, shift, n);
+}
+static void fillDtype(int dt, void* buf, float base, int shift, size_t bytes, cudaStream_t s) {
+    const size_t n = bytes / dtypeSize(dt);
+    if (dt == DT_HALF)      fillTyped<__half>(buf, base, shift, n, s);
+    else if (dt == DT_BF16) fillTyped<__nv_bfloat16>(buf, base, shift, n, s);
+    else                    fillTyped<float>(buf, base, shift, n, s);
+}
+
+// launchPushTyped — launch one push kernel instantiated for element type T.
+template <typename T>
+static void launchPushTyped(int ll, int nBlocks, cudaStream_t stream,
+                            const float4* in, float4* out, size_t nlines,
+                            ncclLLA2AHandle_t pushLL, ncclWindow_t pushWin,
+                            size_t slotLines, int slot, ncclDevComm_t devComm) {
+    if (ll)
+        oneshot_lsa_push_ll_allreduce_kernel<T>
+            <<<nBlocks, LSA_PUSH_LL_THREADS, 0, stream>>>(in, out, pushLL, nlines, devComm);
+    else
+        oneshot_lsa_push_allreduce_kernel<T>
+            <<<nBlocks, LSA_PUSH_THREADS, 0, stream>>>(in, out, pushWin, slotLines, nlines,
+                                                       slot, devComm);
+}
+
 // poison_float4_buffer — set .w of each float4 slot to LSA_POISON.
 // Cannot use cudaMemset since 0xFFFAFFFA is not a uniform byte pattern.
 __global__ void poison_float4_buffer(float4* buf, int n) {
@@ -230,6 +292,7 @@ int main(int argc, char* argv[]) {
     long minMsgBytes = (long)sizeof(float4);
     long maxMsgBytes = (long)PERF_MAX_NLINES * (long)sizeof(float4);
     bool useGraph    = true;
+    int  dtype       = DT_FLOAT;
 
     static const struct option longOpts[] = {
         { "min-cta",  required_argument, nullptr, 'c' },
@@ -237,18 +300,28 @@ int main(int argc, char* argv[]) {
         { "min-msg",  required_argument, nullptr, 'm' },
         { "max-msg",  required_argument, nullptr, 'M' },
         { "no-graph", no_argument,       nullptr, 'G' },
+        { "dtype",    required_argument, nullptr, 'd' },
         { "help",     no_argument,       nullptr, 'h' },
         { nullptr,    0,                 nullptr,  0  }
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "c:C:m:M:h", longOpts, nullptr)) != -1) {
+    while ((opt = getopt_long(argc, argv, "c:C:m:M:d:h", longOpts, nullptr)) != -1) {
         switch (opt) {
             case 'c': minCtaCount = atoi(optarg); break;
             case 'C': maxCtaCount = atoi(optarg); break;
             case 'm': minMsgBytes = atol(optarg); break;
             case 'M': maxMsgBytes = atol(optarg); break;
             case 'G': useGraph    = false;         break;
+            case 'd':
+                if      (!strcmp(optarg, "float")) dtype = DT_FLOAT;
+                else if (!strcmp(optarg, "half"))  dtype = DT_HALF;
+                else if (!strcmp(optarg, "bf16"))  dtype = DT_BF16;
+                else {
+                    if (myRank == 0) fprintf(stderr, "Error: --dtype must be float, half or bf16.\n");
+                    MPI_Finalize(); return 1;
+                }
+                break;
             case 'h': if (myRank == 0) printUsage(argv[0]); MPI_Finalize(); return 0;
             default:  if (myRank == 0) printUsage(argv[0]); MPI_Finalize(); return 1;
         }
@@ -526,16 +599,17 @@ int main(int argc, char* argv[]) {
     // The push kernel alternates its scratch slot on every call.
     unsigned pushSlot = 0;
     auto launchPush = [&](int ll, int nBlocks, const float4* in, float4* out,
-                          size_t nlines) {
-        if (ll)
-            oneshot_lsa_push_ll_allreduce_kernel
-                <<<nBlocks, LSA_PUSH_LL_THREADS, 0, stream>>>(
-                    in, out, pushLL, nlines, devComm);
+                          size_t nlines, int dt) {
+        const int slot = ll ? 0 : (int)(pushSlot++ & 1);
+        if (dt == DT_HALF)
+            launchPushTyped<__half>(ll, nBlocks, stream, in, out, nlines,
+                                    pushLL, pushWin, pushSlotLines, slot, devComm);
+        else if (dt == DT_BF16)
+            launchPushTyped<__nv_bfloat16>(ll, nBlocks, stream, in, out, nlines,
+                                           pushLL, pushWin, pushSlotLines, slot, devComm);
         else
-            oneshot_lsa_push_allreduce_kernel
-                <<<nBlocks, LSA_PUSH_THREADS, 0, stream>>>(
-                    in, out, pushWin, pushSlotLines, nlines,
-                    (int)(pushSlot++ & 1), devComm);
+            launchPushTyped<float>(ll, nBlocks, stream, in, out, nlines,
+                                   pushLL, pushWin, pushSlotLines, slot, devComm);
     };
 
     int pass = 1;
@@ -672,7 +746,7 @@ int main(int argc, char* argv[]) {
                     const float4* in  = (k == 0) ? sendBuff : bufs[(k - 1) % 2];
                     float4*       out = (k == PUSH_TEST_ITERS - 1) ? bufs[(k - 1) % 2]
                                                                    : bufs[k % 2];
-                    launchPush(ll, tCtaCount, in, out, (size_t)tNlines);
+                    launchPush(ll, tCtaCount, in, out, (size_t)tNlines, DT_FLOAT);
                 }
                 CUDACHECK(cudaStreamSynchronize(stream));
 
@@ -692,6 +766,57 @@ int main(int argc, char* argv[]) {
                 if (pass && myRank == 0) printf("[Correctness %s] PASS\n", tag);
                 fflush(stdout);
             }
+
+            // ---- 6f. oneshot_lsa_push(_ll) in half and bf16 ----
+            //
+            // The protocol is type-independent (the chain above covers it),
+            // so this checks the typed add: rank r sends (r+1) * 2^(i % 8),
+            // two calls back to back (both scratch slots / LL parities), and
+            // every element must equal nRanks*(nRanks+1)/2 * 2^(i % 8)
+            // exactly.  Exact for up to 22 ranks in bf16, 31 in half.
+            for (int dt = DT_HALF; dt < DT_COUNT && hasLsa && pass; dt++) {
+                if ((size_t)tNlines > pushSlotLines) continue;
+                const size_t lineBytes = (size_t)tNlines * sizeof(float4);
+                const size_t nElem     = lineBytes / dtypeSize(dt);
+                fillDtype(dt, sendBuff, (float)(myRank + 1), 1, lineBytes, stream);
+                for (int ll = 0; ll < 2 && pass; ll++) {
+                    snprintf(tag, sizeof(tag), "%s %s[nlines=%d,ctas=%d]",
+                             ll ? "oneshot_lsa_push_ll" : "oneshot_lsa_push",
+                             dtypeName(dt), tNlines, tCtaCount);
+                    float4* bufs[2] = { recvBuff, recvBuff2 };
+                    MPICHECK(MPI_Barrier(MPI_COMM_WORLD));
+                    for (int k = 0; k < 2; k++)
+                        launchPush(ll, tCtaCount, sendBuff, bufs[k], (size_t)tNlines, dt);
+                    for (int k = 0; k < 2 && pass; k++) {
+                        if (dt == DT_HALF)
+                            to_float<__half><<<(unsigned)((nElem + 255) / 256), 256, 0, stream>>>(
+                                (const __half*)bufs[k], (float*)recvBuff3, nElem);
+                        else
+                            to_float<__nv_bfloat16><<<(unsigned)((nElem + 255) / 256), 256, 0, stream>>>(
+                                (const __nv_bfloat16*)bufs[k], (float*)recvBuff3, nElem);
+                        std::vector<float> h(nElem);
+                        CUDACHECK(cudaMemcpyAsync(h.data(), recvBuff3, nElem * sizeof(float),
+                                                  cudaMemcpyDeviceToHost, stream));
+                        CUDACHECK(cudaStreamSynchronize(stream));
+                        for (size_t i = 0; i < nElem; i++) {
+                            const float want = EXPECTED * (float)(1 << (i & 7));
+                            if (h[i] != want) {
+                                fprintf(stderr, "[Rank %d] %s FAIL: call %d elem %zu = %g,"
+                                        " expected %g\n", myRank, tag, k, i, h[i], want);
+                                pass = 0;
+                                break;
+                            }
+                        }
+                    }
+                    MPICHECK(MPI_Allreduce(MPI_IN_PLACE, &pass, 1, MPI_INT,
+                                           MPI_MIN, MPI_COMM_WORLD));
+                    if (pass && myRank == 0) printf("[Correctness %s] PASS\n", tag);
+                    fflush(stdout);
+                }
+                // Restore the float input the other tests expect.
+                fillDtype(DT_FLOAT, sendBuff, (float)(myRank + 1), 0, lineBytes, stream);
+                CUDACHECK(cudaStreamSynchronize(stream));
+            }
         }
     }
 
@@ -700,14 +825,13 @@ int main(int argc, char* argv[]) {
     if (myRank == 0) printf("\n");
     fflush(stdout);
 
-    // Re-fill sendBuff with 1.0f for the performance sweep so bandwidth
-    // numbers reflect a uniform-data workload.
-    {
-        int nFloats = (int)((size_t)PERF_MAX_NLINES * 4);
-        fill_float<<<(nFloats + 255) / 256, 256, 0, stream>>>(
-            (float*)sendBuff, 1.0f, nFloats);
-    }
+    // Re-fill sendBuff with 1.0 (in the sweep's dtype) for the performance
+    // sweep so bandwidth numbers reflect a uniform-data workload.  The MC
+    // kernels are float only, so they are skipped for half and bf16.
+    fillDtype(dtype, sendBuff, 1.0f, 0, bufBytes, stream);
     CUDACHECK(cudaStreamSynchronize(stream));
+    const bool mcPerf = hasMC && dtype == DT_FLOAT;
+    if (myRank == 0) printf("dtype: %s\n\n", dtypeName(dtype));
 
     // ------------------------------------------------------------------
     // 7. Performance sweep
@@ -757,7 +881,7 @@ int main(int argc, char* argv[]) {
 
             // ---- oneshot_mc ----
             float oneLat = 0.f;
-            if (hasMC) {
+            if (mcPerf) {
                 CUDACHECK(cudaMemset(flushBuf, 0, L2_FLUSH_BYTES));
                 MPICHECK(MPI_Barrier(MPI_COMM_WORLD));
                 for (int i = 0; i < WARMUP_ITERS; i++)
@@ -777,7 +901,7 @@ int main(int argc, char* argv[]) {
 
             // ---- twoshot_mc_simple ----
             float twoLat = 0.f;
-            if (hasMC && twoNlines >= nRanks) {
+            if (mcPerf && twoNlines >= nRanks) {
                 CUDACHECK(cudaMemset(flushBuf, 0, L2_FLUSH_BYTES));
                 MPICHECK(MPI_Barrier(MPI_COMM_WORLD));
                 for (int i = 0; i < WARMUP_ITERS; i++)
@@ -803,7 +927,7 @@ int main(int argc, char* argv[]) {
             // The timed loop always uses skip_barrier=true (steady state).
             // nTimed is rounded up to a multiple of 3 for a balanced rotation.
             float poisLat = 0.f;
-            if (hasMC && twoNlines >= nRanks) {
+            if (mcPerf && twoNlines >= nRanks) {
                 float4*      poisBufs[3] = { recvBuff,  recvBuff2,  recvBuff3  };
                 ncclWindow_t poisWins[3] = { recvWin,   recvWin2,   recvWin3   };
                 int poisonBlocks = ((int)twoNlines + 255) / 256;
@@ -846,13 +970,13 @@ int main(int argc, char* argv[]) {
                 CUDACHECK(cudaMemset(flushBuf, 0, L2_FLUSH_BYTES));
                 MPICHECK(MPI_Barrier(MPI_COMM_WORLD));
                 for (int i = 0; i < WARMUP_ITERS; i++)
-                    launchPush(ll, nBlocks, sendBuff, recvBuff, (size_t)nlines);
+                    launchPush(ll, nBlocks, sendBuff, recvBuff, (size_t)nlines, dtype);
                 CUDACHECK(cudaStreamSynchronize(stream));
 
                 MPICHECK(MPI_Barrier(MPI_COMM_WORLD));
                 pushLat[ll] = runTimed(useGraph, nTimed, stream, evStart, evStop, [&]() {
                     for (int i = 0; i < nTimed; i++)
-                        launchPush(ll, nBlocks, sendBuff, recvBuff, (size_t)nlines);
+                        launchPush(ll, nBlocks, sendBuff, recvBuff, (size_t)nlines, dtype);
                 });
                 MPICHECK(MPI_Allreduce(MPI_IN_PLACE, &pushLat[ll], 1, MPI_FLOAT,
                                        MPI_MAX, MPI_COMM_WORLD));
@@ -865,7 +989,7 @@ int main(int argc, char* argv[]) {
                 MPICHECK(MPI_Barrier(MPI_COMM_WORLD));
                 for (int i = 0; i < WARMUP_ITERS; i++)
                     NCCLCHECK(ncclAllReduce(sendBuff, recvBuff,
-                                           (size_t)nlines * 4, ncclFloat, ncclSum,
+                                           (size_t)nlines * sizeof(float4) / dtypeSize(dtype), dtypeNccl(dtype), ncclSum,
                                            comm, stream));
                 CUDACHECK(cudaStreamSynchronize(stream));
 
@@ -873,7 +997,7 @@ int main(int argc, char* argv[]) {
                 ncclLat = runTimed(useGraph, nTimed, stream, evStart, evStop, [&]() {
                     for (int i = 0; i < nTimed; i++)
                         NCCLCHECK(ncclAllReduce(sendBuff, recvBuff,
-                                               (size_t)nlines * 4, ncclFloat, ncclSum,
+                                               (size_t)nlines * sizeof(float4) / dtypeSize(dtype), dtypeNccl(dtype), ncclSum,
                                                comm, stream));
                 });
                 MPICHECK(MPI_Allreduce(MPI_IN_PLACE, &ncclLat, 1, MPI_FLOAT,
@@ -895,10 +1019,10 @@ int main(int argc, char* argv[]) {
                 char pushLat_s[2][32] = { "N/A", "N/A" }, pushBw_s[2][32] = { "N/A", "N/A" };
                 char ncclLat_s[32], ncclBw_s[32];
 
-                if (hasMC)
+                if (mcPerf)
                     fmtCols(oneLat_s, oneBw_s, oneLat,
                             nlines * (long)sizeof(float4));
-                if (hasMC && twoNlines >= nRanks) {
+                if (mcPerf && twoNlines >= nRanks) {
                     fmtCols(twoLat_s, twoBw_s, twoLat,
                             twoNlines * (long)sizeof(float4));
                     fmtCols(poisLat_s, poisBw_s, poisLat,

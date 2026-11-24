@@ -30,6 +30,9 @@
 //               (r == myRank ? sendLocal[i] : recv(idx of r)).
 //   3. endEpoch.
 //
+// T is the element type (float, __half or __nv_bfloat16), as in the
+// barrier variant.  The LL lines carry 16-byte payloads for every type.
+//
 // Requirements:
 //   - ll: from ncclLLA2ACreateRequirement(nBlocks >= gridDim.x, nSlots) with
 //     nSlots >= ncclLLA2ACalcSlots((lsaSize - 1) * chunkLines, sizeof(float4)),
@@ -41,6 +44,7 @@
 
 #include <cuda_runtime.h>
 #include "nccl_device.h"
+#include "lsa_push_reduce.cuh"
 
 #define LSA_PUSH_LL_MAXTHREADS 1024
 
@@ -49,10 +53,7 @@ __host__ __device__ __forceinline__ size_t lsaPushLLChunkLines(size_t nlines, in
     return (c + 31) & ~(size_t)31;
 }
 
-__device__ __forceinline__ float4 lsaPushLLAdd(float4 a, float4 b) {
-    return make_float4(a.x + b.x, a.y + b.y, a.z + b.z, a.w + b.w);
-}
-
+template <typename T = float>
 __global__ void __launch_bounds__(LSA_PUSH_LL_MAXTHREADS)
     oneshot_lsa_push_ll_allreduce_kernel(const float4*     sendLocal,
                                          float4*           recvLocal,
@@ -86,7 +87,7 @@ __global__ void __launch_bounds__(LSA_PUSH_LL_MAXTHREADS)
             float4 v = (r == team.rank)
                 ? sendLocal[lo + j]
                 : ses.recv<float4>((r < team.rank ? r : r - 1) * (int)chunk + j);
-            acc = (r == 0) ? v : lsaPushLLAdd(acc, v);
+            acc = (r == 0) ? v : LsaPushSum<T>::add(acc, v);
         }
         recvLocal[lo + j] = acc;
     }
