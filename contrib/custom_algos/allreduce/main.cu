@@ -178,6 +178,12 @@ static float runTimed(bool useGraph, int nTimed,
         CUDACHECK(cudaStreamEndCapture(stream, &graph));
         CUDACHECK(cudaGraphInstantiate(&exec, graph, 0));
         CUDACHECK(cudaGraphDestroy(graph));
+        // Upload the graph before timing.  Otherwise the first launch also
+        // pays the upload of every node, which inflates the per-iteration
+        // time, most for kernels with large parameter blocks (ncclAllReduce).
+        CUDACHECK(cudaGraphUpload(exec, stream));
+        CUDACHECK(cudaStreamSynchronize(stream));
+        MPICHECK(MPI_Barrier(MPI_COMM_WORLD));
         CUDACHECK(cudaEventRecord(evStart, stream));
         CUDACHECK(cudaGraphLaunch(exec, stream));
         CUDACHECK(cudaEventRecord(evStop, stream));

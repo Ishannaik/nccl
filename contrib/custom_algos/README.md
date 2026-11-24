@@ -14,3 +14,4 @@ Reference custom collective kernels built on the NCCL Device API.
 | GitHub | Areas |
 |--------|------|
 | @akhillanger | All |
+| @Ishannaik | `allreduce/` LSA push kernels (`oneshot_lsa_push*`, `lsa_push_reduce.cuh`) |

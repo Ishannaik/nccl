@@ -183,6 +183,47 @@ as soon as its own elements have arrived.  The cost is 2× the bytes on the
 wire, so it wins for small messages and loses once the transfer is
 bandwidth-bound.
 
+### Memory ordering over PCIe (both push kernels)
+
+PCIe peer memory is not coherent with the reader's caches, and a reader that
+polls a flag with relaxed ordering can see the flag before the data it
+guards.  vLLM hit exactly this on PCIe: its custom all-reduce, with a relaxed
+start barrier, read stale data on every call
+([vllm#61848](https://github.com/vllm-project/vllm/pull/61848)).  The push
+kernels avoid it as follows.
+
+- **`oneshot_lsa_push`**: every hand-off between ranks goes through the LSA
+  barrier with `memory_order_acq_rel` at system scope.  The arrive is a
+  release: after the CTA synchronises, a system-scope fence orders all of the
+  CTA's remote data stores before its flag store.  The wait is an acquire, so
+  the local scratch reads in the reduce step see the peers' data.  No data is
+  read through a relaxed flag.
+- **`oneshot_lsa_push_ll`**: there is no fence, so no ordering between
+  separate stores is assumed.  Each 8-byte word holds 4 bytes of data and its
+  own 4-byte epoch flag, and an aligned 8-byte store reaches the peer as one
+  unit (the same assumption as NCCL's LL protocol).  A reader that sees the
+  current epoch in a word has that word's data.  Data left from an earlier
+  call carries an older epoch and is rejected.
+- **Slot reuse** (write-after-read): both kernels alternate between two
+  slots.  A rank writes a slot again only in call k+2.  It can only start
+  call k+2 after it has received every peer's call k+1 data, and each peer
+  sends that only after its call k (which read the slot) has finished, in
+  stream order.
+
+compute-sanitizer `memcheck`, `racecheck` and `synccheck` report no
+errors for the push kernels (2 × A10, 1 KB to 1 MB, with and without CUDA
+graphs).  This covers memory errors and shared-memory races only, not
+cross-GPU ordering, which the chained correctness test checks.
+
+### Element types
+
+Both push kernels are templated on the element type: `float`, `__half`
+and `__nv_bfloat16` (`lsa_push_reduce.cuh`).  Data moves as 16-byte lines
+for every type, so only the local add changes.  Sums are in rank order on
+every rank, so all ranks get bit-identical results in every type.  The driver
+tests half and bf16 with exact expected values, and `--dtype` selects the
+type for the sweep (the MC kernels are float only and are skipped).
+
 ---
 
 ## Performance
@@ -333,6 +374,7 @@ mpirun -np <N> build/test/custom_algos/allreduce/allreduce [options]
 | `-m, --min-msg B` | 16      | Smallest message size in bytes           |
 | `-M, --max-msg B` | 128 MB  | Largest message size in bytes            |
 | `--no-graph`      | off     | Disable CUDA graph capture               |
+| `-d, --dtype T`   | float   | `float`, `half` or `bf16` for the push kernels and the NCCL baseline |
 
 The driver runs correctness tests for all kernels the hardware supports
 first, then a latency sweep printing one row per message size per CTA count.
