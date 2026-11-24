@@ -450,6 +450,11 @@ int main(int argc, char* argv[]) {
                                          &pushWin, NCCL_WIN_COLL_SYMMETRIC));
     }
 
+    float4 *ncclSendPlain, *ncclRecvPlain;   // EXPERIMENT: plain cudaMalloc buffers
+    CUDACHECK(cudaMalloc((void**)&ncclSendPlain, bufBytes));
+    CUDACHECK(cudaMalloc((void**)&ncclRecvPlain, bufBytes));
+    const bool plainNccl = getenv("PLAIN_NCCL") != nullptr;
+
     char* flushBuf;
     CUDACHECK(cudaMalloc((void**)&flushBuf, L2_FLUSH_BYTES));
 
@@ -837,6 +842,10 @@ int main(int argc, char* argv[]) {
     fillDtype(dtype, sendBuff, 1.0f, 0, bufBytes, stream);
     CUDACHECK(cudaStreamSynchronize(stream));
     const bool mcPerf = hasMC && dtype == DT_FLOAT;
+    CUDACHECK(cudaMemcpy(ncclSendPlain, sendBuff, bufBytes, cudaMemcpyDeviceToDevice));
+    float4* ncclS = plainNccl ? ncclSendPlain : sendBuff;
+    float4* ncclR = plainNccl ? ncclRecvPlain : recvBuff;
+    if (myRank == 0) printf("nccl buffers: %s\n", plainNccl ? "plain cudaMalloc" : "registered windows");
     if (myRank == 0) printf("dtype: %s\n\n", dtypeName(dtype));
 
     // ------------------------------------------------------------------
@@ -994,7 +1003,7 @@ int main(int argc, char* argv[]) {
                 CUDACHECK(cudaMemset(flushBuf, 0, L2_FLUSH_BYTES));
                 MPICHECK(MPI_Barrier(MPI_COMM_WORLD));
                 for (int i = 0; i < WARMUP_ITERS; i++)
-                    NCCLCHECK(ncclAllReduce(sendBuff, recvBuff,
+                    NCCLCHECK(ncclAllReduce(ncclS, ncclR,
                                            (size_t)nlines * sizeof(float4) / dtypeSize(dtype), dtypeNccl(dtype), ncclSum,
                                            comm, stream));
                 CUDACHECK(cudaStreamSynchronize(stream));
@@ -1002,7 +1011,7 @@ int main(int argc, char* argv[]) {
                 MPICHECK(MPI_Barrier(MPI_COMM_WORLD));
                 ncclLat = runTimed(useGraph, nTimed, stream, evStart, evStop, [&]() {
                     for (int i = 0; i < nTimed; i++)
-                        NCCLCHECK(ncclAllReduce(sendBuff, recvBuff,
+                        NCCLCHECK(ncclAllReduce(ncclS, ncclR,
                                                (size_t)nlines * sizeof(float4) / dtypeSize(dtype), dtypeNccl(dtype), ncclSum,
                                                comm, stream));
                 });
